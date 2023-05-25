@@ -1,64 +1,90 @@
-use axum::{
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{get, post},
-    Json, Router,
-};
+use axum::extract::Path;
+use axum::routing::get;
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+use heed::{types::Str, Env};
+use heed::{Database, EnvOpenOptions};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::fs;
+use std::path::Path as StdPath;
+use std::sync::Arc;
+
+struct AppState {
+    kv_env: Env,
+    kv: Database<Str, Str>,
+}
 
 #[tokio::main]
 async fn main() {
-    // initialize tracing
     tracing_subscriber::fmt::init();
 
-    // build our application with a route
-    let app = Router::new()
-        // `GET /` goes to `root`
-        .route("/", get(root))
-        // `POST /users` goes to `create_user`
-        .route("/users", post(create_user));
+    // Create dir
+    fs::create_dir_all(StdPath::new("target").join("heed.mdb")).unwrap();
 
-    // run our app with hyper
+    // Create env
+    let env = EnvOpenOptions::new()
+        .open(StdPath::new("target").join("heed.mdb"))
+        .unwrap();
+
+    // We will open the default unamed database
+    let kv: Database<Str, Str> = env.create_database(None).unwrap();
+
+    // Create shared state to pass around the db ref
+    let shared_state = Arc::new(AppState { kv_env: env, kv });
+
+    // Build our application with a route
+    let app = Router::new()
+        .route("/", get(get_all))
+        .route("/:key", get(get_key))
+        .route("/", post(create_key))
+        .with_state(shared_state);
+
     let addr = &"0.0.0.0:3000".parse().unwrap();
 
     tracing::info!("listening on {}", addr);
 
+    // Run with hyper
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
         .await
         .unwrap();
 }
 
-// basic handler that responds with a static string
-async fn root() -> &'static str {
-    "Hello, World!\n"
+async fn get_all(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let rtxn = state.kv_env.read_txn().unwrap();
+    let values = state.kv.iter(&rtxn).unwrap();
+
+    let ok_values: Vec<_> = values.filter_map(Result::ok).collect();
+
+    (StatusCode::OK, Json(json!(ok_values)))
 }
 
-async fn create_user(
-    // this argument tells axum to parse the request body
-    // as JSON into a `CreateUser` type
-    Json(payload): Json<CreateUser>,
+async fn get_key(State(state): State<Arc<AppState>>, Path(key): Path<String>) -> impl IntoResponse {
+    let rtxn = state.kv_env.read_txn().unwrap();
+
+    let value = state.kv.get(&rtxn, &key).unwrap().unwrap().to_string();
+
+    (StatusCode::OK, Json(KVPayload { key, value }))
+}
+
+async fn create_key(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<KVPayload>,
 ) -> impl IntoResponse {
-    // insert your application logic here
-    let user = User {
-        id: 1337,
-        username: payload.username,
-    };
+    let mut wtxn = state.kv_env.write_txn().unwrap();
 
-    // this will be converted into a JSON response
-    // with a status code of `201 Created`
-    (StatusCode::CREATED, Json(user))
+    state
+        .kv
+        .put(&mut wtxn, &payload.key, &payload.value)
+        .unwrap();
+
+    wtxn.commit().unwrap();
+
+    StatusCode::CREATED
 }
 
-// the input to our `create_user` handler
-#[derive(Deserialize)]
-struct CreateUser {
-    username: String,
-}
-
-// the output to our `create_user` handler
-#[derive(Serialize)]
-struct User {
-    id: u64,
-    username: String,
+#[derive(Serialize, Deserialize)]
+struct KVPayload {
+    key: String,
+    value: String,
 }
