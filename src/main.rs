@@ -1,12 +1,16 @@
-use axum::extract::Path;
-use axum::routing::{delete, get};
+use axum::extract::{MatchedPath, Path};
+use axum::routing::{delete, get, put};
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use heed::{types::Str, Env};
 use heed::{Database, EnvOpenOptions};
+use hyper::Request;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
 use std::sync::Arc;
+use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::trace::TraceLayer;
+use tracing::info_span;
 
 struct AppState {
     kv_env: Env,
@@ -17,12 +21,12 @@ struct AppState {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let addr = &"0.0.0.0:3000".parse().unwrap();
+    let addr = std::env::var("SOCKET_ADDRESS").unwrap_or_else(|_| String::from("0.0.0.0:3000"));
 
     tracing::info!("listening on {}", addr);
 
     // Run with hyper
-    axum::Server::bind(&addr)
+    axum::Server::bind(&addr.parse().unwrap())
         .serve(app().into_make_service())
         .await
         .unwrap();
@@ -50,10 +54,31 @@ fn app() -> Router {
         .route("/:key", get(get_key))
         // POST /
         .route("/", post(create_key))
+        // PUT /:key
+        .route("/:key", put(update_key))
         // DELETE /
         .route("/", delete(delete_all))
         // DELETE /:key
         .route("/:key", delete(delete_key))
+        // Add panic recovery
+        .layer(CatchPanicLayer::new())
+        // Add tracing middleware
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
+                // Log the matched route's path (with placeholders not filled in).
+                // Use request.uri() or OriginalUri if you want the real path.
+                let matched_path = request
+                    .extensions()
+                    .get::<MatchedPath>()
+                    .map(MatchedPath::as_str);
+
+                info_span!(
+                    "http_request",
+                    method = ?request.method(),
+                    matched_path
+                )
+            }),
+        )
         // Add shared state
         .with_state(shared_state)
 }
@@ -95,6 +120,26 @@ async fn create_key(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<KVPayload>,
 ) -> impl IntoResponse {
+    let rtxn = state.kv_env.read_txn().unwrap();
+
+    let value = state.kv.get(&rtxn, &payload.key);
+
+    // Check if the key already exists
+    if let Ok(Some(_)) = value {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Key already exists" })),
+        );
+    }
+
+    // If an error occurs during the retrieval process
+    if let Err(_) = value {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Internal server error" })),
+        );
+    }
+
     let mut wtxn = state.kv_env.write_txn().unwrap();
 
     state
@@ -104,7 +149,35 @@ async fn create_key(
 
     wtxn.commit().unwrap();
 
-    StatusCode::CREATED
+    (
+        StatusCode::CREATED,
+        Json(json!({ "key": payload.key, "value": payload.value })),
+    )
+}
+
+async fn update_key(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+    Json(payload): Json<KVPayload>,
+) -> impl IntoResponse {
+    let mut wtxn = state.kv_env.write_txn().unwrap();
+
+    let value = state.kv.put(&mut wtxn, &key, &payload.value);
+
+    match value {
+        Ok(_) => {
+            wtxn.commit().unwrap();
+
+            (
+                StatusCode::OK,
+                Json(json!({ "key": key, "value": payload.value })),
+            )
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Internal server error" })),
+        ),
+    }
 }
 
 async fn delete_all(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -240,6 +313,77 @@ mod tests {
         let response = app.ready().await.unwrap().call(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn create_duplicate() {
+        let mut app = setup_tests().await;
+
+        let insert_body = json!({"key": "foo", "value": "bar"});
+
+        // Create key
+        let request = Request::builder()
+            .method(http::Method::POST)
+            .uri("/")
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(insert_body.to_string()))
+            .unwrap();
+
+        app.ready().await.unwrap().call(request).await.unwrap();
+
+        // Create duplicate key
+        let request = Request::builder()
+            .method(http::Method::POST)
+            .uri("/")
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(insert_body.to_string()))
+            .unwrap();
+
+        let response = app.ready().await.unwrap().call(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn update_key() {
+        let mut app = setup_tests().await;
+
+        let insert_body = json!({"key": "foo", "value": "bar"});
+
+        // Create key
+        let request = Request::builder()
+            .method(http::Method::POST)
+            .uri("/")
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(insert_body.to_string()))
+            .unwrap();
+
+        app.ready().await.unwrap().call(request).await.unwrap();
+
+        // Update key
+        let update_body = json!({"key": "foo", "value": "baz"});
+
+        let request = Request::builder()
+            .method(http::Method::PUT)
+            .uri("/foo")
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(update_body.to_string()))
+            .unwrap();
+
+        let response = app.ready().await.unwrap().call(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Get key
+        let request = Request::builder().uri("/foo").body(Body::empty()).unwrap();
+        let response = app.ready().await.unwrap().call(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(body, update_body)
     }
 
     #[tokio::test]

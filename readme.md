@@ -20,12 +20,13 @@
 
 # TODO
 - [x] Add tests
-- [ ] Conform to proper REST API standards
+- [x] Conform to proper REST API standards
 - [ ] Add more documentation
-- [ ] Add more configuration options
-- [ ] Add more error handling, I think we should be able to use the `?` syntax more
-- [ ] Add more logging
-- [ ] Add more metrics
+- [x] Add more configuration options
+- [x] Add more error handling
+- [ ] I think we should be able to use the `?` syntax more
+- [x] Add more logging
+- [x] Add more metrics
 - [ ] Add more security
 - [ ] Add more validation
 
