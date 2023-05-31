@@ -1,11 +1,12 @@
 use axum::extract::{MatchedPath, Path};
+use axum::response::Response;
 use axum::routing::{delete, get, put};
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use heed::{types::Str, Env};
-use heed::{Database, EnvOpenOptions};
+use heed::{Database, EnvOpenOptions, Error};
 use hyper::Request;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::fs;
 use std::sync::Arc;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -83,30 +84,35 @@ fn app() -> Router {
         .with_state(shared_state)
 }
 
-async fn get_all(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn get_all(
+    State(state): State<Arc<AppState>>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
     let rtxn = state.kv_env.read_txn().unwrap();
     let values = state.kv.iter(&rtxn).unwrap();
 
     let ok_values: Vec<_> = values.filter_map(Result::ok).collect();
 
-    (StatusCode::OK, Json(json!(ok_values)))
+    Ok((StatusCode::OK, Json(json!(ok_values))))
 }
 
-async fn get_key(State(state): State<Arc<AppState>>, Path(key): Path<String>) -> impl IntoResponse {
+async fn get_key(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
     let rtxn = state.kv_env.read_txn().unwrap();
 
     let value = state.kv.get(&rtxn, &key);
 
     match value {
-        Ok(Some(value)) => (StatusCode::OK, Json(json!({ "key": key, "value": value }))),
-        Ok(None) => (
+        Ok(Some(value)) => Ok((StatusCode::OK, Json(json!({ "key": key, "value": value })))),
+        Ok(None) => Ok((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "Key not found" })),
-        ),
-        Err(_) => (
+        )),
+        Err(_) => Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "Internal server error" })),
-        ),
+        )),
     }
 }
 
@@ -119,25 +125,25 @@ struct KVPayload {
 async fn create_key(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<KVPayload>,
-) -> impl IntoResponse {
+) -> Result<(StatusCode, Json<Value>), AppError> {
     let rtxn = state.kv_env.read_txn().unwrap();
 
     let value = state.kv.get(&rtxn, &payload.key);
 
     // Check if the key already exists
     if let Ok(Some(_)) = value {
-        return (
+        return Ok((
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "Key already exists" })),
-        );
+        ));
     }
 
     // If an error occurs during the retrieval process
     if let Err(_) = value {
-        return (
+        return Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "Internal server error" })),
-        );
+        ));
     }
 
     let mut wtxn = state.kv_env.write_txn().unwrap();
@@ -149,17 +155,17 @@ async fn create_key(
 
     wtxn.commit().unwrap();
 
-    (
+    Ok((
         StatusCode::CREATED,
         Json(json!({ "key": payload.key, "value": payload.value })),
-    )
+    ))
 }
 
 async fn update_key(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
     Json(payload): Json<KVPayload>,
-) -> impl IntoResponse {
+) -> Result<(StatusCode, Json<Value>), AppError> {
     let mut wtxn = state.kv_env.write_txn().unwrap();
 
     let value = state.kv.put(&mut wtxn, &key, &payload.value);
@@ -168,32 +174,32 @@ async fn update_key(
         Ok(_) => {
             wtxn.commit().unwrap();
 
-            (
+            Ok((
                 StatusCode::OK,
                 Json(json!({ "key": key, "value": payload.value })),
-            )
+            ))
         }
-        Err(_) => (
+        Err(_) => Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "Internal server error" })),
-        ),
+        )),
     }
 }
 
-async fn delete_all(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn delete_all(State(state): State<Arc<AppState>>) -> Result<StatusCode, AppError> {
     let mut wtxn = state.kv_env.write_txn().unwrap();
 
     state.kv.clear(&mut wtxn).unwrap();
 
     wtxn.commit().unwrap();
 
-    StatusCode::OK
+    Ok(StatusCode::OK)
 }
 
 async fn delete_key(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
-) -> impl IntoResponse {
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     let mut wtxn = state.kv_env.write_txn().unwrap();
 
     let value = state.kv.delete(&mut wtxn, &key);
@@ -202,16 +208,40 @@ async fn delete_key(
         Ok(true) => {
             wtxn.commit().unwrap();
 
-            (StatusCode::OK, Json(json!({ "key": key })))
+            Ok((StatusCode::OK, Json(json!({ "key": key }))))
         }
-        Ok(false) => (
+        Ok(false) => Ok((
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "Key not found" })),
-        ),
-        Err(_) => (
+        )),
+        Err(_) => Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "Internal server error" })),
-        ),
+        )),
+    }
+}
+
+struct AppError(anyhow::Error);
+
+// Tell axum how to convert `AppError` into a response.
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Something went wrong: {}", self.0),
+        )
+            .into_response()
+    }
+}
+
+// This enables using `?` on functions that return `Result<_, anyhow::Error>` to turn them into
+// `Result<_, AppError>`. That way you don't need to do that manually.
+impl<E> From<E> for AppError
+where
+    E: Into<anyhow::Error>,
+{
+    fn from(err: E) -> Self {
+        Self(err.into())
     }
 }
 
